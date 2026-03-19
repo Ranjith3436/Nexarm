@@ -1,0 +1,111 @@
+# ================================================================
+#  Nexarm — Docker Compose
+#  Services: ollama | backend (Flask + MedGemma) | frontend (Vite)
+#  GPU: NVIDIA T4 (CUDA 12) required for MedGemma acceleration
+# ================================================================
+
+services:
+
+  # ── Ollama (Qwen3 chat model) ─────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: nexarm-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Ollama model puller (runs once at startup) ─────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: nexarm-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: >
+      /bin/sh -c "
+        echo '=== Checking Ollama models ===' &&
+        if ! ollama list 2>/dev/null | grep -q 'qwen3:8b'; then
+          echo '>>> Pulling qwen3:8b (this may take a few minutes)...'
+          OLLAMA_HOST=http://ollama:11434 ollama pull qwen3:8b
+          echo '>>> qwen3:8b pulled successfully.'
+        else
+          echo '>>> qwen3:8b already present, skipping pull.'
+        fi &&
+        echo '=== Ollama init complete ==='
+      "
+    restart: "no"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  # ── Backend (Flask + MedGemma + Cancer Adapter) ───────────────
+  backend:
+    build:
+      context: ./General-Mdeical-Bot
+      dockerfile: Dockerfile
+    container_name: nexarm-backend
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    volumes:
+      # Persist chat session DB and uploads
+      - backend_db:/app/src/databases
+      - backend_uploads:/tmp/medbot_uploads
+      # Mount HuggingFace cache to avoid re-downloading the model
+      - hf_cache:/root/.cache/huggingface
+    env_file:
+      - ./General-Mdeical-Bot/.env.docker
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/sessions"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s   # Extra time for MedGemma model loading
+
+  # ── Frontend (Vite/React) ─────────────────────────────────────
+  frontend:
+    build:
+      context: ./mystic-haven
+      dockerfile: Dockerfile
+    container_name: nexarm-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./mystic-haven/.env
+
+# ── Named volumes ─────────────────────────────────────────────
+volumes:
+  ollama_data:           # Stores downloaded Ollama models
+  backend_db:            # SQLite chat session database
+  backend_uploads:       # Uploaded image/file temp storage
+  hf_cache:              # HuggingFace model cache (pre-loaded)
